@@ -1,4 +1,4 @@
-name: Build Termux Bootstrap Only (Fast)
+name: Build Termux Bootstrap with OpenJDK 21 (from your deb)
 
 on:
   workflow_dispatch:
@@ -7,30 +7,32 @@ on:
         description: "Package name"
         required: false
         default: "com.vault.fide"
-      add:
-        description: "Additional packages (comma-separated)"
-        required: false
-        default: "openjdk-21,p7zip,git,axel"
       arch:
-        description: "Architecture (single for speed)"
+        description: "Architecture (aarch64, arm, i686, x86_64)"
         required: false
         default: "aarch64"
+      openjdk_deb_url:
+        description: "URL to your pre-built openjdk-21 .deb file"
+        required: true
 
 jobs:
-  build-bootstrap:
+  build:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout termux-generator
-        uses: actions/checkout@v4
-        with:
-          repository: robertkirkman/termux-generator
-          ref: master
-
-      - name: Build bootstrap only (no APKs, no X11, single arch)
+      - name: Clone termux-generator (with retries)
         run: |
+          for i in {1..5}; do
+            echo "Attempt $i: cloning termux-generator..."
+            git clone --depth 1 https://github.com/robertkirkman/termux-generator.git . && break
+            sleep 30
+          done
+
+      - name: Build minimal bootstrap with OpenJDK dependencies
+        run: |
+          # All of these dependencies compile very quickly (seconds each)
           ./build-termux.sh \
             --name "${{ github.event.inputs.name }}" \
-            --add "${{ github.event.inputs.add }}" \
+            --add "libandroid-shmem,libandroid-spawn,libiconv,libjpeg-turbo,zlib,littlecms,alsa-lib" \
             --architectures "${{ github.event.inputs.arch }}" \
             --disable-terminal \
             --disable-tasker \
@@ -43,8 +45,40 @@ jobs:
             --disable-x11 \
             --disable-bootstrap-second-stage
 
-      - name: Upload bootstrap zip
+      - name: Download your pre-built openjdk-21 deb
+        run: |
+          wget -q "${{ github.event.inputs.openjdk_deb_url }}" -O openjdk-21.deb
+
+      - name: Inject openjdk-21 into bootstrap and fix paths
+        run: |
+          BOOTSTRAP_ZIP=$(ls bootstrap-*.zip | head -1)
+          WORKDIR=inject
+          mkdir -p $WORKDIR
+          cd $WORKDIR
+          # Extract the bootstrap zip
+          unzip -q ../$BOOTSTRAP_ZIP
+          # Extract the openjdk-21 deb directly into the bootstrap's usr/
+          ar x ../openjdk-21.deb data.tar.xz
+          tar -xf data.tar.xz --strip-components=2 --skip-old-files -C . ./data/data/com.termux/files/usr/ 2>/dev/null || true
+          rm data.tar.xz
+          # Replace all occurrences of com.termux with com.vault.fide in text files
+          find . -type f -exec sed -i 's/com\.termux/com.vault.fide/g' {} \;
+          # For ELF binaries, fix interpreter and RPATH
+          sudo apt-get update && sudo apt-get install -y patchelf
+          find . -type f -executable -exec sh -c '
+            if file "$1" | grep -q ELF; then
+              patchelf --set-interpreter "/data/data/com.vault.fide/files/usr/bin/ld-android.so" "$1" 2>/dev/null || true
+              patchelf --set-rpath "/data/data/com.vault.fide/files/usr/lib" "$1" 2>/dev/null || true
+            fi
+          ' _ {} \;
+          # Recreate any broken symlinks (OpenJDK has few)
+          # Zip everything back
+          zip -r9 ../bootstrap-final.zip .
+          cd ..
+          mv bootstrap-final.zip bootstrap-${{ github.event.inputs.arch }}-with-openjdk.zip
+
+      - name: Upload final bootstrap
         uses: actions/upload-artifact@v4.6.0
         with:
-          name: termux-bootstrap-${{ github.event.inputs.arch }}
-          path: ./bootstrap-*.zip
+          name: termux-bootstrap-${{ github.event.inputs.arch }}-with-openjdk
+          path: bootstrap-*-with-openjdk.zip
